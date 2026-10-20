@@ -5,7 +5,6 @@ import numpy as np
 from nnkit.activations import sigmoid, softcap, softcap_backward
 from nnkit.base import (
     BACKEND,
-    Module,
     Param,
     asarray,
     decoder_mask,
@@ -146,7 +145,7 @@ def check_attention(
     return relative_error(params, reference_grads(params, loss_of_model))
 
 
-def check_norm(norm: Module) -> float:
+def check_norm(norm: L2Norm | RMSNorm) -> float:
     """A normalisation layer on its own, input gradient included."""
     seed(0)
     x = Param(normal(1.0, (2, 3, 8)))
