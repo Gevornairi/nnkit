@@ -4,8 +4,9 @@ from .decoder_layer import DecoderLayer
 from .dropout import Dropout
 from .embedding import Embedding
 from .encoder_layer import EncoderLayer
+from .l2_norm import L2Norm
 from .linear import Linear
-from .multi_head_attention import MultiHeadAttention
+from .multi_head_attention import MultiHeadAttention, diff_lambda_init
 from .rms_norm import RMSNorm
 from .rope import RoPE
 from .swiglu_feed_forward import SwiGLUFeedForward
@@ -15,9 +16,11 @@ __all__ = [
     "Dropout",
     "Embedding",
     "EncoderLayer",
+    "L2Norm",
     "Linear",
     "MultiHeadAttention",
     "RMSNorm",
     "RoPE",
     "SwiGLUFeedForward",
+    "diff_lambda_init",
 ]

@@ -4,13 +4,35 @@ A from-scratch neural network toolkit with hand-written `forward` and `backward`
 
 Built as the shared foundation for from-scratch paper implementations (`transformer-remastered`, `dino-remastered`, etc.).
 
+## Installation
+
+```sh
+uv add git+https://github.com/Gevornairi/nnkit --tag v0.3.0
+```
+
+For co-developing nnkit alongside a paper repo, point `[tool.uv.sources]` at a local checkout instead:
+
+```toml
+nnkit = { path = "../nnkit", editable = true }
+```
+
+## Backend
+
+The backend is chosen from environment variables when `nnkit` is first imported:
+
+| Variable | Values | Default |
+| --- | --- | --- |
+| `NNKIT_BACKEND` | `mlx`, `numpy` | `mlx` |
+| `NNKIT_DTYPE` | `float32`, `float64` (NumPy only) | `float32` |
+
 ## Subpackages
 
 - **`nnkit.base`**: Dual array backend (`mlx` / `numpy`), `Module`, `Param`, and attention masks (`padding_mask`, `causal_mask`, `decoder_mask`).
 - **`nnkit.activations`**: `SiLU`, `softmax`, `log_softmax`, `softmax_backward`.
-- **`nnkit.layers`**: `Linear`, `Embedding`, `Dropout`, `RMSNorm`, `RoPE`, `SwiGLUFeedForward`, `MultiHeadAttention` (with GQA/MQA), `EncoderLayer`, `DecoderLayer`.
+- **`nnkit.layers`**: `Linear`, `Embedding`, `Dropout`, `L2Norm` (unit length), `RMSNorm` (optional gain), `RoPE`, `SwiGLUFeedForward`, `MultiHeadAttention` (with GQA/MQA, QK-Norm with or without a learned gain, iRoPE temperature scaling, and differential attention), `EncoderLayer`, `DecoderLayer`.
 - **`nnkit.losses`**: `LabelSmoothingLoss`.
 - **`nnkit.optimisers`**: `AdamW` (with global-norm gradient clipping), `CosineSchedule`, `NoamSchedule`.
+- **`nnkit.training`**: `Prefetcher` (builds batches on a background thread from any `make_epoch(rng)` function), `save_checkpoint` / `load_checkpoint` (model, optimizer state and arbitrary metadata in one `.npz`), `read_checkpoint_metadata`.
 
 ## Gradient Check
 
@@ -20,4 +42,7 @@ NNKIT_BACKEND=numpy NNKIT_DTYPE=float64 uv run python -m tests.gradcheck
 
 # MLX autodiff on Apple GPU
 uv run python -m tests.gradcheck
+
+# Checkpoint round trip and prefetcher
+uv run python -m tests.training_check
 ```

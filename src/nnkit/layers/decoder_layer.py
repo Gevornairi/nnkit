@@ -31,13 +31,16 @@ class DecoderLayer(Module):
         dropout: float = 0.1,
         rope: RoPE | None = None,
         n_kv_heads: int | None = None,
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout, rope, n_kv_heads)
+        self.self_attn = MultiHeadAttention(
+            d_model, n_heads, dropout, rope, n_kv_heads, qk_norm
+        )
         self.drop1 = Dropout(dropout)
         self.norm1 = RMSNorm(d_model)
         self.cross_attn = MultiHeadAttention(
-            d_model, n_heads, dropout, n_kv_heads=n_kv_heads
+            d_model, n_heads, dropout, n_kv_heads=n_kv_heads, qk_norm=qk_norm
         )
         self.drop2 = Dropout(dropout)
         self.norm2 = RMSNorm(d_model)
