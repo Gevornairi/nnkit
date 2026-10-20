@@ -12,9 +12,11 @@ from .backend import (
     scatter_add,
     seed,
     to_numpy,
+    top_k_indices,
     uniform,
     xp,
 )
+from .buffer import Buffer
 from .masking import causal_mask, decoder_mask, padding_mask
 from .module import Module
 from .param import Param
@@ -24,6 +26,7 @@ __all__ = [
     "DTYPE",
     "INT",
     "Array",
+    "Buffer",
     "Module",
     "Param",
     "asarray",
@@ -36,6 +39,7 @@ __all__ = [
     "scatter_add",
     "seed",
     "to_numpy",
+    "top_k_indices",
     "uniform",
     "xp",
 ]

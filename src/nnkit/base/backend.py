@@ -96,3 +96,11 @@ def materialize(*trees) -> None:
     """Force MLX's lazy graph to run so it doesn't grow across steps (no-op on NumPy)."""
     if BACKEND == "mlx":
         xp.eval(*trees)
+
+
+def top_k_indices(x: Array, k: int) -> Array:
+    """Indices of the ``k`` largest entries along the last axis, in no particular order.
+
+    Shape (..., n) -> (..., k). Ties are broken arbitrarily.
+    """
+    return xp.argpartition(-x, k - 1, axis=-1)[..., :k]

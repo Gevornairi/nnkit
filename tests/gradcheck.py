@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from nnkit.activations import sigmoid, softcap, softcap_backward
 from nnkit.base import (
     BACKEND,
     Module,
@@ -12,6 +13,7 @@ from nnkit.base import (
     padding_mask,
     seed,
     to_numpy,
+    top_k_indices,
     xp,
 )
 from nnkit.layers import (
@@ -20,6 +22,7 @@ from nnkit.layers import (
     EncoderLayer,
     L2Norm,
     Linear,
+    MoEFeedForward,
     MultiHeadAttention,
     RMSNorm,
     RoPE,
@@ -191,6 +194,97 @@ def check_relative_position(**attn_kwargs) -> float:
     return float(np.abs(gap).max())
 
 
+def check_moe(
+    top_k: int,
+    normalize_gates: bool,
+    dispatch: str = "sparse",
+    dead_expert: bool = False,
+) -> float:
+    """MoE feed-forward with a non-zero bias that changes which experts are chosen.
+
+    Finite differences must not flip a top-k choice, so the test asserts a
+    margin between the k-th and (k+1)-th biased scores. With ``dead_expert``
+    the last expert is never chosen, which the sparse path must skip cleanly.
+    """
+    seed(0)
+    d_model, n_experts = 8, 4
+    moe = MoEFeedForward(
+        d_model, n_experts, 8, top_k, normalize_gates, dropout=0.0, dispatch=dispatch
+    )
+    bias = normal(0.3, (n_experts,))
+    if dead_expert:
+        bias = bias + xp.array([0.0] * (n_experts - 1) + [-10.0])
+    moe.expert_bias.value = bias
+    x = Param(normal(1.0, (2, 5, d_model)))
+    weights = normal(1.0, (2, 5, d_model))  # loss = sum(out * weights)
+    params = [x, *moe.parameters()]
+
+    s = sigmoid(moe.router.forward(x.value.reshape(-1, d_model)))
+    biased = s + moe.expert_bias.value
+    ranked = np.sort(to_numpy(biased), axis=-1)[:, ::-1]
+    if top_k < n_experts:
+        assert (ranked[:, top_k - 1] - ranked[:, top_k]).min() > 1e-4, "top-k tie"
+    plain = np.sort(to_numpy(top_k_indices(s, top_k)), axis=-1)
+    with_bias = np.sort(to_numpy(top_k_indices(biased, top_k)), axis=-1)
+    assert (plain != with_bias).any(), "bias should change some choices"
+
+    def loss_of_model():
+        return (moe.forward(x.value) * weights).sum()
+
+    moe.zero_grad()
+    moe.forward(x.value)
+    x.grad = moe.backward(weights)
+    if dead_expert:
+        dead = moe.experts[-1].parameters()
+        assert all(not np.any(to_numpy(p.grad)) for p in dead), "dead expert got grad"
+
+    return relative_error(params, reference_grads(params, loss_of_model))
+
+
+def check_moe_dispatch(top_k: int, normalize_gates: bool) -> float:
+    """Sparse dispatch must match the dense reference: outputs, dx and every param grad.
+
+    Returns the largest difference relative to the largest value of each array.
+    On the MLX GPU this is ~1e-3, not ~1e-7: its batched matmul carries ~1e-3
+    relative error while a one-row matmul is exact to float32, and an expert
+    that receives a single token takes the one-row path. A dispatch bug (wrong
+    token or gate) shows up as O(1).
+    """
+    results = []
+    for dispatch in ("dense", "sparse"):
+        seed(0)
+        moe = MoEFeedForward(
+            8, 4, 8, top_k, normalize_gates, dropout=0.0, dispatch=dispatch
+        )
+        moe.expert_bias.value = normal(0.3, (4,))
+        x, weights = normal(1.0, (2, 5, 8)), normal(1.0, (2, 5, 8))
+        y = moe.forward(x)
+        dx = moe.backward(weights)
+        results.append([y, dx, *(p.grad for p in moe.parameters())])
+    errors = []
+    for a, b in zip(*results):
+        a, b = to_numpy(a), to_numpy(b)
+        scale = max(float(np.abs(a).max()), 1e-12)  # unused experts have all-zero grads
+        errors.append(float(np.abs(a - b).max()) / scale)
+    return max(errors)
+
+
+def check_softcap(cap: float = 5.0) -> float:
+    """Soft-capping with inputs up to ~3x the cap, so the saturated region is covered."""
+    seed(0)
+    x = Param(normal(cap, (4, 16)))
+    weights = normal(1.0, (4, 16))  # loss = sum(out * weights)
+    saturated = np.abs(to_numpy(x.value)) > 2 * cap
+    assert saturated.any(), "test inputs should reach the saturated region"
+
+    def loss_of_model():
+        return (softcap(x.value, cap) * weights).sum()
+
+    x.grad = softcap_backward(softcap(x.value, cap), weights, cap)
+
+    return relative_error([x], reference_grads([x], loss_of_model))
+
+
 def main() -> int:
     tol = 1e-4 if BACKEND == "mlx" else 1e-7
     ok = True
@@ -227,12 +321,32 @@ def main() -> int:
     ]:
         report(f"norm {label}", check_norm(norm))
 
+    report("softcap cap=5", check_softcap(5.0))
+
     # log-probabilities magnify float32 rounding to ~1e-3; a misplaced norm gain gives ~0.2-0.7
     rel_tol = 1e-2 if BACKEND == "mlx" else 1e-7
     for kwargs in [{}, {"qk_norm": True}, {"qk_norm": True, "qk_norm_gain": True}]:
         opts = " ".join(f"{k}={v}" for k, v in kwargs.items()) or "plain"
         err = check_relative_position(**kwargs)
         report(f"rope relative position {opts}", err, rel_tol)
+
+    # MLX GPU batched matmul is ~1e-3 relative; a dispatch bug gives O(1)
+    dispatch_tol = 1e-2 if BACKEND == "mlx" else 1e-12
+    for top_k, normalize in [(1, False), (2, True), (2, False)]:
+        for dispatch in ("dense", "sparse"):
+            report(
+                f"moe {dispatch} top_k={top_k} normalize_gates={normalize}",
+                check_moe(top_k, normalize, dispatch),
+            )
+        report(
+            f"moe sparse == dense top_k={top_k} normalize_gates={normalize}",
+            check_moe_dispatch(top_k, normalize),
+            dispatch_tol,
+        )
+    report(
+        "moe sparse with an unused expert",
+        check_moe(2, True, "sparse", dead_expert=True),
+    )
 
     return 0 if ok else 1
 

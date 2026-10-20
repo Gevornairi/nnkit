@@ -6,6 +6,7 @@ from .embedding import Embedding
 from .encoder_layer import EncoderLayer
 from .l2_norm import L2Norm
 from .linear import Linear
+from .moe import MoEFeedForward
 from .multi_head_attention import MultiHeadAttention, diff_lambda_init
 from .rms_norm import RMSNorm
 from .rope import RoPE
@@ -18,6 +19,7 @@ __all__ = [
     "EncoderLayer",
     "L2Norm",
     "Linear",
+    "MoEFeedForward",
     "MultiHeadAttention",
     "RMSNorm",
     "RoPE",

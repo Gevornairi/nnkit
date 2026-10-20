@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nnkit.base import seed, to_numpy
+from nnkit.base import INT, Buffer, Module, seed, to_numpy, xp
 from nnkit.layers import Linear, RMSNorm
 from nnkit.optimisers import AdamW
 from nnkit.training import (
@@ -21,17 +21,51 @@ from nnkit.training import (
 )
 
 
+class _Counter(Module):
+    """A child holding an integer buffer, so nested and non-float buffers are covered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.counts = Buffer(xp.zeros(2, dtype=INT))
+        self.register_buffers(self.counts)
+
+
 class _Tiny(Linear):
-    """A Linear plus an RMSNorm, so the checkpoint has 2D and 1D parameters."""
+    """A Linear plus an RMSNorm (2D and 1D parameters), a float buffer and a child's int buffer."""
 
     def __init__(self) -> None:
         super().__init__(4, 3)
         self.norm = RMSNorm(3)
-        self.register_modules(self.norm)
+        self.bias = Buffer(xp.zeros(3))
+        self.counter = _Counter()
+        self.register_modules(self.norm, self.counter)
+        self.register_buffers(self.bias)
+
+
+class _Bigger(_Tiny):
+    """_Tiny with one more parameter, for architecture-mismatch errors."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.extra = Linear(3, 3)
+        self.register_modules(self.extra)
 
 
 def _values(module) -> list[np.ndarray]:
     return [to_numpy(p.value) for p in module.parameters()]
+
+
+def _buffer_values(module) -> list[np.ndarray]:
+    return [to_numpy(b.value) for b in module.buffers()]
+
+
+def _expect_value_error(fn, what: str) -> None:
+    try:
+        fn()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"expected ValueError for {what}")
 
 
 def check_checkpoint_round_trip() -> None:
@@ -41,6 +75,10 @@ def check_checkpoint_round_trip() -> None:
     for p in model.parameters():  # one update so the optimizer state is non-trivial
         p.grad = p.value * 0 + 1
     opt.step()
+    model.bias.value = xp.array(
+        [1.0, 2.0, 3.0]
+    )  # non-zero buffers, so a load is visible
+    model.counter.counts.value = xp.array([4, 5], dtype=INT)
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "ckpt.npz"
@@ -55,6 +93,9 @@ def check_checkpoint_round_trip() -> None:
         assert read_checkpoint_metadata(path) == meta
         for a, b in zip(_values(model), _values(restored)):
             np.testing.assert_array_equal(a, b)
+        for a, b in zip(_buffer_values(model), _buffer_values(restored)):
+            np.testing.assert_array_equal(a, b)
+        assert restored.counter.counts.value.dtype == INT  # buffer dtypes survive
         assert restored_opt.step_count == opt.step_count == 1
         for a, b in zip(opt.m + opt.v, restored_opt.m + restored_opt.v):
             np.testing.assert_array_equal(to_numpy(a), to_numpy(b))
@@ -62,21 +103,27 @@ def check_checkpoint_round_trip() -> None:
 
         # model-only checkpoint: loading into an optimizer is an error
         save_checkpoint(path, model, step=1)
-        try:
-            load_checkpoint(path, _Tiny(), AdamW(_Tiny().parameters(), lambda s: 0.0))
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("expected ValueError for missing optimizer state")
+        _expect_value_error(
+            lambda: load_checkpoint(
+                path, _Tiny(), AdamW(_Tiny().parameters(), lambda s: 0.0)
+            ),
+            "missing optimizer state",
+        )
 
-        # metadata may not shadow parameter or optimizer keys
-        for bad in ({"p0": 1}, {"opt_m0": 1}):
-            try:
-                save_checkpoint(path, model, **bad)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError(f"expected ValueError for metadata {bad}")
+        # metadata may not shadow parameter, buffer or optimizer keys
+        for bad in ({"p0": 1}, {"b0": 1}, {"opt_m0": 1}):
+            _expect_value_error(
+                lambda bad=bad: save_checkpoint(path, model, **bad), f"metadata {bad}"
+            )
+
+    # the architecture must match: extra or missing parameters and buffers are errors
+    _expect_value_error(lambda: _Tiny().load_state(_Bigger().state()), "extra params")
+    _expect_value_error(lambda: _Bigger().load_state(_Tiny().state()), "missing params")
+    no_buffers = {k: v for k, v in _Tiny().state().items() if k[0] == "p"}
+    _expect_value_error(lambda: _Tiny().load_state(no_buffers), "missing buffers")
+    # a model without buffers still loads a parameters-only state
+    plain = Linear(4, 3)
+    plain.load_state(Linear(4, 3).state())
 
 
 def check_prefetcher() -> None:

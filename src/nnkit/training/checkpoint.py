@@ -1,7 +1,8 @@
 """Save and restore model + optimizer state and metadata as a single .npz file.
 
-File layout: model parameters under ``p0, p1, ...`` (``Module.state`` order),
-optimizer state under ``opt_*``, and every metadata value under its own key.
+File layout: model parameters under ``p0, p1, ...`` and buffers under
+``b0, b1, ...`` (``Module.state`` order), optimizer state under ``opt_*``,
+and every metadata value under its own key.
 """
 
 import re
@@ -12,7 +13,7 @@ import numpy as np
 
 from ..base import Module
 
-_PARAM_KEY = re.compile(r"p\d+")
+_MODEL_KEY = re.compile(r"[pb]\d+")  # parameters and buffers
 _OPT_PREFIX = "opt_"
 
 
@@ -25,7 +26,7 @@ class Stateful(Protocol):
 
 
 def _is_reserved(key: str) -> bool:
-    return bool(_PARAM_KEY.fullmatch(key)) or key.startswith(_OPT_PREFIX)
+    return bool(_MODEL_KEY.fullmatch(key)) or key.startswith(_OPT_PREFIX)
 
 
 def save_checkpoint(
@@ -40,7 +41,7 @@ def save_checkpoint(
     reserved = [k for k in metadata if _is_reserved(k)]
     if reserved:
         raise ValueError(
-            f"metadata keys {reserved} clash with parameter/optimizer keys"
+            f"metadata keys {reserved} clash with parameter/buffer/optimizer keys"
         )
     arrays = dict(model.state())
     if optimizer is not None:
@@ -68,7 +69,7 @@ def load_checkpoint(
     raise ``ValueError`` (see ``Module.load_state``).
     """
     with np.load(path) as z:
-        model.load_state({k: z[k] for k in z.files if _PARAM_KEY.fullmatch(k)})
+        model.load_state({k: z[k] for k in z.files if _MODEL_KEY.fullmatch(k)})
         if optimizer is not None:
             opt_state = {
                 k[len(_OPT_PREFIX) :]: z[k]

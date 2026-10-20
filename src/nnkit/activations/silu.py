@@ -1,13 +1,8 @@
 """SiLU (swish) activation."""
 
-from ..base.backend import Array, xp
+from ..base.backend import Array
 from ..base.module import Module
-
-
-def _sigmoid(z: Array) -> Array:
-    """1 / (1 + e^-z), evaluated so that exp never overflows."""
-    e = xp.exp(-xp.abs(z))
-    return xp.where(z >= 0, 1.0 / (1.0 + e), e / (1.0 + e))
+from .sigmoid import sigmoid
 
 
 class SiLU(Module):
@@ -18,7 +13,7 @@ class SiLU(Module):
         self._cache: tuple[Array, Array] | None = None  # (z, sigmoid(z))
 
     def forward(self, z: Array) -> Array:
-        s = _sigmoid(z)
+        s = sigmoid(z)
         self._cache = (z, s)
 
         return z * s
