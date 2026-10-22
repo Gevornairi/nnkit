@@ -5,6 +5,7 @@ import numpy as np
 from nnkit.activations import sigmoid, softcap, softcap_backward
 from nnkit.base import (
     BACKEND,
+    Module,
     Param,
     asarray,
     decoder_mask,
@@ -25,6 +26,7 @@ from nnkit.layers import (
     MultiHeadAttention,
     RMSNorm,
     RoPE,
+    TiedProjection,
 )
 from nnkit.losses import LabelSmoothingLoss
 
@@ -198,17 +200,26 @@ def check_moe(
     normalize_gates: bool,
     dispatch: str = "sparse",
     dead_expert: bool = False,
+    gate_input: bool = False,
 ) -> float:
     """MoE feed-forward with a non-zero bias that changes which experts are chosen.
 
     Finite differences must not flip a top-k choice, so the test asserts a
     margin between the k-th and (k+1)-th biased scores. With ``dead_expert``
     the last expert is never chosen, which the sparse path must skip cleanly.
+    ``gate_input`` applies the gate to the expert's input (Llama 4) instead of its output.
     """
     seed(0)
     d_model, n_experts = 8, 4
     moe = MoEFeedForward(
-        d_model, n_experts, 8, top_k, normalize_gates, dropout=0.0, dispatch=dispatch
+        d_model,
+        n_experts,
+        8,
+        top_k,
+        normalize_gates,
+        dropout=0.0,
+        dispatch=dispatch,
+        gate_input=gate_input,
     )
     bias = normal(0.3, (n_experts,))
     if dead_expert:
@@ -240,7 +251,9 @@ def check_moe(
     return relative_error(params, reference_grads(params, loss_of_model))
 
 
-def check_moe_dispatch(top_k: int, normalize_gates: bool) -> float:
+def check_moe_dispatch(
+    top_k: int, normalize_gates: bool, gate_input: bool = False
+) -> float:
     """Sparse dispatch must match the dense reference: outputs, dx and every param grad.
 
     Returns the largest difference relative to the largest value of each array.
@@ -253,7 +266,14 @@ def check_moe_dispatch(top_k: int, normalize_gates: bool) -> float:
     for dispatch in ("dense", "sparse"):
         seed(0)
         moe = MoEFeedForward(
-            8, 4, 8, top_k, normalize_gates, dropout=0.0, dispatch=dispatch
+            8,
+            4,
+            8,
+            top_k,
+            normalize_gates,
+            dropout=0.0,
+            dispatch=dispatch,
+            gate_input=gate_input,
         )
         moe.expert_bias.value = normal(0.3, (4,))
         x, weights = normal(1.0, (2, 5, 8)), normal(1.0, (2, 5, 8))
@@ -266,6 +286,26 @@ def check_moe_dispatch(top_k: int, normalize_gates: bool) -> float:
         scale = max(float(np.abs(a).max()), 1e-12)  # unused experts have all-zero grads
         errors.append(float(np.abs(a - b).max()) / scale)
     return max(errors)
+
+
+def check_moe_gating_differs() -> None:
+    """Input and output gating must give different outputs for the same weights, so the
+    flag cannot be silently ignored; with every gate 1 they must agree exactly."""
+    outputs = []
+    for gate_input in (False, True):
+        seed(0)
+        moe = MoEFeedForward(8, 4, 8, 1, dropout=0.0, gate_input=gate_input)
+        x = normal(1.0, (2, 5, 8))
+        outputs.append(to_numpy(moe.forward(x)))
+    assert np.abs(outputs[0] - outputs[1]).max() > 1e-3, "gate_input had no effect"
+
+    for gate_input in (False, True):  # top-1 with gates forced to 1: both are expert(x)
+        seed(0)
+        moe = MoEFeedForward(8, 4, 8, 1, dropout=0.0, gate_input=gate_input)
+        moe.router.weight.value = moe.router.weight.value * 0.0 + 1e3  # sigmoid -> 1
+        x = normal(1.0, (2, 5, 8))
+        outputs.append(to_numpy(moe.forward(x)))
+    np.testing.assert_allclose(outputs[2], outputs[3], rtol=1e-5, atol=1e-6)
 
 
 def check_softcap(cap: float = 5.0) -> float:
@@ -282,6 +322,81 @@ def check_softcap(cap: float = 5.0) -> float:
     x.grad = softcap_backward(softcap(x.value, cap), weights, cap)
 
     return relative_error([x], reference_grads([x], loss_of_model))
+
+
+def check_embedding(scale: bool) -> float:
+    """Embedding lookup with and without the sqrt(d_model) scale; ids repeat on purpose,
+    so gradients of a token used twice must accumulate."""
+    seed(0)
+    vocab, d_model = 6, 8
+    emb = Embedding(vocab, d_model, scale=scale)
+    ids = asarray([[1, 3, 3, 0], [2, 3, 1, 1]])
+    weights = normal(1.0, (2, 4, d_model))  # loss = sum(out * weights)
+    factor = d_model**0.5 if scale else 1.0
+    rows = to_numpy(emb.weight.value)[to_numpy(ids)]
+    np.testing.assert_allclose(to_numpy(emb.forward(ids)), rows * factor, rtol=1e-6)
+
+    def loss_of_model():
+        return (emb.forward(ids) * weights).sum()
+
+    emb.zero_grad()
+    emb.backward(weights, ids)
+
+    return relative_error([emb.weight], reference_grads([emb.weight], loss_of_model))
+
+
+def check_tied_projection(shared: bool) -> float:
+    """TiedProjection on its own (``shared=False``: table and input gradients), or after the
+    lookup of the same Embedding (``shared=True``): the table is used at both ends, so the
+    lookup's and the projection's gradients must add up in its one ``grad``.
+
+    Runs two backward passes without zeroing, like gradient accumulation over two
+    micro-batches, and compares with twice the reference: a backward that overwrites
+    ``grad`` instead of adding to it would otherwise go unnoticed, because the projection's
+    backward runs first, while ``grad`` is still zero."""
+    seed(0)
+    vocab, d_model = 6, 8
+    emb = Embedding(vocab, d_model, scale=False)
+    head = TiedProjection(emb)
+    ids = asarray([[1, 3, 3, 0], [2, 3, 1, 1]])
+    x = Param(normal(1.0, (2, 4, d_model)))
+    weights = normal(1.0, (2, 4, vocab))  # loss = sum(logits * weights)
+    params = [emb.weight] if shared else [x, emb.weight]
+
+    def logits():
+        return head.forward(emb.forward(ids) if shared else x.value)
+
+    def loss_of_model():
+        return (logits() * weights).sum()
+
+    head.zero_grad()
+    x.grad = xp.zeros_like(x.value)
+    for _ in range(2):  # two accumulated micro-batches
+        logits()
+        dx = head.backward(weights)
+        if shared:
+            emb.backward(dx, ids)
+        else:
+            x.grad = x.grad + dx
+    reference = [2 * r for r in reference_grads(params, loss_of_model)]
+
+    return relative_error(params, reference)
+
+
+def check_tied_registration() -> None:
+    """A model holding both the Embedding and its TiedProjection lists the table once."""
+
+    class Model(Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed = Embedding(6, 8)
+            self.head = TiedProjection(self.embed)
+            self.register_modules(self.embed, self.head)
+
+    model = Model()
+    params = model.parameters()
+    assert len(params) == 1 and params[0] is model.embed.weight, len(params)
+    assert model.head.parameters()[0] is model.embed.weight
 
 
 def main() -> int:
@@ -322,6 +437,15 @@ def main() -> int:
 
     report("softcap cap=5", check_softcap(5.0))
 
+    for scale in (True, False):
+        report(f"embedding scale={scale}", check_embedding(scale))
+
+    check_tied_registration()
+    report("tied projection alone", check_tied_projection(shared=False))
+    report(
+        "tied projection + lookup (shared table)", check_tied_projection(shared=True)
+    )
+
     # log-probabilities magnify float32 rounding to ~1e-3; a misplaced norm gain gives ~0.2-0.7
     rel_tol = 1e-2 if BACKEND == "mlx" else 1e-7
     for kwargs in [{}, {"qk_norm": True}, {"qk_norm": True, "qk_norm_gain": True}]:
@@ -346,6 +470,20 @@ def main() -> int:
         "moe sparse with an unused expert",
         check_moe(2, True, "sparse", dead_expert=True),
     )
+
+    # Llama 4 input gating: the gate scales the token before the expert
+    for top_k, normalize in [(1, False), (2, True)]:
+        for dispatch in ("dense", "sparse"):
+            report(
+                f"moe gate_input {dispatch} top_k={top_k} normalize_gates={normalize}",
+                check_moe(top_k, normalize, dispatch, gate_input=True),
+            )
+        report(
+            f"moe gate_input sparse == dense top_k={top_k} normalize_gates={normalize}",
+            check_moe_dispatch(top_k, normalize, gate_input=True),
+            dispatch_tol,
+        )
+    check_moe_gating_differs()
 
     return 0 if ok else 1
 

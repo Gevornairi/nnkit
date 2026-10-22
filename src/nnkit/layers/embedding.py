@@ -8,19 +8,21 @@ from ..base.param import Param
 
 
 class Embedding(Module):
-    """Look up a row of ``weight`` per token id and scale it by sqrt(d_model).
+    """Look up a row of ``weight`` per token id, scaled by sqrt(d_model) unless ``scale=False``.
 
     ``weight`` (vocab, d_model) is initialised with std d_model^-0.5, so the
-    scaled embeddings start with roughly unit RMS. With shared embeddings the
-    same table is also the output projection (``Transformer.project``).
+    scaled embeddings start with roughly unit RMS (2017 Transformer, Gemma).
+    Llama-style models use ``scale=False``: positions come from RoPE and every block
+    starts with RMSNorm, so nothing needs the extra scale. With shared embeddings the
+    same table is also the output projection.
     """
 
-    def __init__(self, vocab_size: int, d_model: int) -> None:
+    def __init__(self, vocab_size: int, d_model: int, scale: bool = True) -> None:
         super().__init__()
         self.weight = Param(normal(d_model**-0.5, (vocab_size, d_model)))
         self.register_params(self.weight)
         self.d_model = d_model
-        self.scale = math.sqrt(d_model)
+        self.scale = math.sqrt(d_model) if scale else 1.0
 
     def forward(self, ids: Array) -> Array:
         """``ids`` (batch, T) int -> (batch, T, d_model)."""

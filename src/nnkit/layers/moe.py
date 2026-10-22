@@ -32,6 +32,11 @@ class MoEFeedForward(Module):
     unchosen outputs by a zero gate: n_experts times the compute, kept as the
     reference the sparse path is tested against.
 
+    With ``gate_input`` the gate scales the token *entering* each expert instead of
+    its output, ``expert_e(g_e * x)``, as in Llama 4's reference implementation.
+    Experts are nonlinear, so weak routes are suppressed more strongly than with
+    output gating.
+
     No gradient flows through the top-k choice or ``b``. In training mode,
     ``forward`` counts the tokens each expert receives; call ``update_bias``
     after each optimizer step to nudge ``b`` toward balanced load.
@@ -47,6 +52,7 @@ class MoEFeedForward(Module):
         bias_update_rate: float = 1e-3,
         dropout: float = 0.1,
         dispatch: str = "sparse",
+        gate_input: bool = False,
     ) -> None:
         super().__init__()
         if not 1 <= top_k <= n_experts:
@@ -58,6 +64,7 @@ class MoEFeedForward(Module):
         self.normalize_gates = normalize_gates
         self.bias_update_rate = bias_update_rate
         self.dispatch = dispatch
+        self.gate_input = gate_input
         self.router = Linear(d_model, n_experts)
         self.experts = [
             SwiGLUFeedForward(d_model, d_ff_expert, dropout) for _ in range(n_experts)
@@ -138,7 +145,19 @@ class MoEFeedForward(Module):
         self.load = xp.zeros_like(self.load)
 
     def _dense_forward(self, x: Array, g: Array) -> tuple[Array, Array]:
-        """Every expert on every token; returns (sum of gated outputs, outputs (N, E, d))."""
+        """Every expert on every token; returns (routed sum, cache for backward).
+
+        The cache is the outputs (N, E, d) with output gating, or the input x with
+        ``gate_input`` (unchosen experts then get a zero input, which SwiGLU without
+        biases maps to zero).
+        """
+        if self.gate_input:
+            routed = sum(
+                e.forward(g[:, i : i + 1] * x) for i, e in enumerate(self.experts)
+            )
+
+            return routed, x
+
         outs = xp.stack([e.forward(x) for e in self.experts], axis=1)
         return (g[:, :, None] * outs).sum(axis=1), outs
 
@@ -155,22 +174,37 @@ class MoEFeedForward(Module):
         ends = np.cumsum(np.bincount(flat_expert, minlength=self.n_experts))
 
         routed = xp.zeros_like(x)
-        active = []  # (expert, rows, gate, output) for experts that got tokens
+        active = []  # (expert, rows, gate, output, input) for experts that got tokens
         for e in range(self.n_experts):
             start = ends[e - 1] if e else 0
             if start == ends[e]:
                 continue  # no tokens: skipped in backward too, its cache is stale
             rows = asarray(tokens_by_expert[start : ends[e]])
             gate = g[rows, e][:, None]
-            out = self.experts[e].forward(x[rows])
+            x_e = x[rows]
+            if self.gate_input:
+                out = self.experts[e].forward(gate * x_e)
+                contribution = out
+            else:
+                out = self.experts[e].forward(x_e)
+                contribution = gate * out
             # a token goes to k experts, so results are accumulated, not assigned
-            routed = scatter_add(routed, rows, gate * out)
-            active.append((e, rows, gate, out))
+            routed = scatter_add(routed, rows, contribution)
+            active.append((e, rows, gate, out, x_e))
         return routed, active
 
-    def _dense_backward(self, dy: Array, g: Array, outs: Array) -> tuple[Array, Array]:
+    def _dense_backward(self, dy: Array, g: Array, cache: Array) -> tuple[Array, Array]:
         """Returns (dx from the experts, d_g (N, E))."""
         dx = xp.zeros_like(dy)
+        if self.gate_input:
+            x, d_g_cols = cache, []
+            for i, expert in enumerate(self.experts):
+                du = expert.backward(dy)
+                d_g_cols.append((du * x).sum(axis=-1))
+                dx = dx + g[:, i : i + 1] * du
+            return dx, xp.stack(d_g_cols, axis=1)
+
+        outs = cache
         for e, expert in enumerate(self.experts):
             dx = dx + expert.backward(g[:, e : e + 1] * dy)
         return dx, (dy[:, None, :] * outs).sum(axis=-1)
@@ -180,8 +214,15 @@ class MoEFeedForward(Module):
         n = dy.shape[0]
         dx = xp.zeros_like(dy)
         d_g_cols = [xp.zeros(n, dtype=dy.dtype) for _ in range(self.n_experts)]
-        for e, rows, gate, out in active:
+        for e, rows, gate, out, x_e in active:
             dy_e = dy[rows]
-            d_g_cols[e] = scatter_add(d_g_cols[e], rows, (dy_e * out).sum(axis=-1))
-            dx = scatter_add(dx, rows, self.experts[e].backward(gate * dy_e))
+            if self.gate_input:
+                du = self.experts[e].backward(dy_e)
+                d_gate, dx_e = (du * x_e).sum(axis=-1), gate * du
+            else:
+                d_gate = (dy_e * out).sum(axis=-1)
+                dx_e = self.experts[e].backward(gate * dy_e)
+
+            d_g_cols[e] = scatter_add(d_g_cols[e], rows, d_gate)
+            dx = scatter_add(dx, rows, dx_e)
         return dx, xp.stack(d_g_cols, axis=1)

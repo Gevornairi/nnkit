@@ -11,6 +11,7 @@ from .multi_head_attention import MultiHeadAttention, diff_lambda_init
 from .rms_norm import RMSNorm
 from .rope import RoPE
 from .swiglu_feed_forward import SwiGLUFeedForward
+from .tied_projection import TiedProjection
 
 __all__ = [
     "DecoderLayer",
@@ -24,5 +25,6 @@ __all__ = [
     "RMSNorm",
     "RoPE",
     "SwiGLUFeedForward",
+    "TiedProjection",
     "diff_lambda_init",
 ]
