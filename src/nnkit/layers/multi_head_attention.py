@@ -3,6 +3,7 @@ attention, QK-Norm, NoPE temperature scaling, and differential attention."""
 
 import math
 
+from ..activations.sigmoid import sigmoid, sigmoid_backward
 from ..activations.softmax import softmax, softmax_backward
 from ..base.backend import Array, xp
 from ..base.module import Module
@@ -54,6 +55,12 @@ class MultiHeadAttention(Module):
     ``lambda_init`` rather than ``exp(lq1.lk1) - exp(lq2.lk2) + lambda_init``;
     use ``diff_lambda_init(layer)`` for the paper's depth-dependent value.
 
+    With ``gate="elementwise"`` (or ``"headwise"``) each head's output is
+    multiplied by ``sigmoid(query_in @ W_g)`` before the output projection
+    (gated attention, Qiu et al., 2025; Qwen3-Next): one gate per output
+    dimension, or one per head. A head can then shrink its output to ~0
+    instead of parking attention on a sink token.
+
     Shapes: query_in (batch, T_q, d_model), kv_in (batch, T_k, d_model),
     mask broadcastable to (batch, n_heads, T_q, T_k) -> (batch, T_q, d_model).
     """
@@ -71,6 +78,7 @@ class MultiHeadAttention(Module):
         attn_scale_floor: int | None = None,
         diff_attn: bool = False,
         lambda_init: float = 0.8,
+        gate: str = "none",
     ) -> None:
         super().__init__()
         if d_model % n_heads:
@@ -91,6 +99,10 @@ class MultiHeadAttention(Module):
             )
         if attn_scale_alpha and rope is not None:
             raise ValueError("attn_scale_alpha is for NoPE layers; pass rope=None")
+        if gate not in ("none", "elementwise", "headwise"):
+            raise ValueError(
+                f"gate={gate!r} must be 'none', 'elementwise' or 'headwise'"
+            )
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.n_rep = n_heads // n_kv_heads  # query heads per key/value head
@@ -126,6 +138,11 @@ class MultiHeadAttention(Module):
             self.sub_norm = RMSNorm(self.d_k)
             self.register_params(self.diff_lambda)
             self.register_modules(self.sub_norm)
+        self.gate = gate
+        if gate != "none":
+            # gate logits from the query input: one per output dimension, or one per head
+            self.w_g = Linear(d_model, d_model if gate == "elementwise" else n_heads)
+            self.register_modules(self.w_g)
         # attention probabilities of the last forward, (batch, n_heads, T_q, T_k), for plotting
         self.attn_weights: Array | None = None
         self._cache = None
@@ -166,6 +183,18 @@ class MultiHeadAttention(Module):
         t = xp.arange(q.shape[-2], dtype=q.dtype)[:, None]
         steps = xp.floor((t + 1.0) / self.attn_scale_floor)
         return 1.0 + self.attn_scale_alpha * xp.log(1.0 + steps)
+
+    def _gate_heads(self, z: Array) -> Array:
+        """Gate logits (batch, T, d_model or n_heads) -> (batch, n_heads, T, d_k or 1)."""
+        if self.gate == "elementwise":
+            return self._split_heads(z, self.n_heads)
+        return z.transpose(0, 2, 1)[..., None]
+
+    def _merge_gate(self, dz: Array) -> Array:
+        """Backward of ``_gate_heads``."""
+        if self.gate == "elementwise":
+            return self._merge_heads(dz)
+        return dz[..., 0].transpose(0, 2, 1)
 
     def forward(
         self, query_in: Array, kv_in: Array, mask: Array | None = None
@@ -213,6 +242,11 @@ class MultiHeadAttention(Module):
         if self.diff_attn:
             context = self.sub_norm.forward(context) * (1.0 - self.lambda_init)
 
+        if self.gate != "none":
+            g = sigmoid(self._gate_heads(self.w_g.forward(query_in)))
+            self._gate_cache = (context, g)
+            context = context * g
+
         out = self.w_o.forward(self._merge_heads(context))
         self.attn_weights = attn
         # q and k are cached after RoPE / QK-Norm / temp scaling: d_scores is w.r.t. the final q and k
@@ -233,6 +267,19 @@ class MultiHeadAttention(Module):
         q, k, v, probs, attn_dropped, mask = self._cache
 
         d_context = self._split_heads(self.w_o.backward(d_out), self.n_heads)
+
+        # the gate is computed from query_in, so its gradient is added to d_query_in below
+        d_query_from_gate: Array | None = None
+        if self.gate != "none":
+            ungated, g = self._gate_cache
+            d_g = d_context * ungated
+            if self.gate == "headwise":
+                d_g = d_g.sum(axis=-1, keepdims=True)
+            d_query_from_gate = self.w_g.backward(
+                self._merge_gate(sigmoid_backward(g, d_g))
+            )
+            d_context = d_context * g
+
         if self.diff_attn:
             d_context = self.sub_norm.backward(d_context * (1.0 - self.lambda_init))
         d_attn_dropped = d_context @ xp.swapaxes(v, -1, -2)
@@ -275,6 +322,10 @@ class MultiHeadAttention(Module):
             d_q, d_k = self._merge_halves(d_q), self._merge_halves(d_k)
 
         d_query_in = self.w_q.backward(self._merge_heads(d_q))
+
+        if d_query_from_gate is not None:
+            d_query_in = d_query_in + d_query_from_gate
+
         d_kv_from_k = self.w_k.backward(self._merge_heads(d_k))
         d_kv_from_v = self.w_v.backward(self._merge_heads(d_v))
 

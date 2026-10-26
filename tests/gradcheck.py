@@ -28,7 +28,7 @@ from nnkit.layers import (
     RoPE,
     TiedProjection,
 )
-from nnkit.losses import LabelSmoothingLoss
+from nnkit.losses import LabelSmoothingLoss, z_loss
 
 PAD, BOS, VOCAB_SIZE = 0, 1, 7
 SRC = [[3, 4, 5, 6], [5, 3, 0, 0]]
@@ -324,6 +324,39 @@ def check_softcap(cap: float = 5.0) -> float:
     return relative_error([x], reference_grads([x], loss_of_model))
 
 
+def check_z_loss() -> float:
+    """z-loss on logits large enough that log Z is far from 0, with one PAD target ignored.
+
+    Also checks the reason it exists: shifting every logit by a constant leaves
+    cross-entropy unchanged but changes the z-loss.
+    """
+    seed(0)
+    logits = Param(normal(3.0, (2, 4, VOCAB_SIZE)))
+    targets = asarray([[3, 4, 5, PAD], [2, 6, 1, 3]])
+
+    def loss_of_model():
+        return z_loss(logits.value, targets, PAD, coef=0.1)[0]
+
+    logits.grad = z_loss(logits.value, targets, PAD, coef=0.1)[1]
+    pad_rows = to_numpy(logits.grad)[0, 3]
+    assert not np.any(pad_rows), "PAD position got gradient"
+
+    ce = LabelSmoothingLoss(VOCAB_SIZE, PAD, 0.0)
+    shifted = logits.value + 5.0
+    assert (
+        abs(float(ce(logits.value, targets)[0]) - float(ce(shifted, targets)[0])) < 1e-4
+    )
+    assert (
+        abs(
+            float(z_loss(shifted, targets, PAD)[0])
+            - float(z_loss(logits.value, targets, PAD)[0])
+        )
+        > 1e-4
+    )
+
+    return relative_error([logits], reference_grads([logits], loss_of_model))
+
+
 def check_embedding(scale: bool) -> float:
     """Embedding lookup with and without the sqrt(d_model) scale; ids repeat on purpose,
     so gradients of a token used twice must accumulate."""
@@ -436,6 +469,18 @@ def main() -> int:
         report(f"norm {label}", check_norm(norm))
 
     report("softcap cap=5", check_softcap(5.0))
+    report("z-loss", check_z_loss())
+
+    for gate in ("elementwise", "headwise"):
+        for h, g, kwargs in [
+            (4, 2, {}),
+            (4, 1, {"diff_attn": True, "qk_norm": True}),
+        ]:
+            opts = " ".join(f"{k}={v}" for k, v in kwargs.items())
+            report(
+                f"attention gate={gate} heads={h} kv_heads={g} {opts}".rstrip(),
+                check_attention(h, g, gate=gate, **kwargs),
+            )
 
     for scale in (True, False):
         report(f"embedding scale={scale}", check_embedding(scale))
