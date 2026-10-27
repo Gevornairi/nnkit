@@ -7,7 +7,7 @@ Built as the shared foundation for from-scratch paper implementations (`transfor
 ## Installation
 
 ```sh
-uv add git+https://github.com/Gevornairi/nnkit --tag v0.6.0
+uv add git+https://github.com/Gevornairi/nnkit --tag v0.7.0
 ```
 
 For co-developing nnkit alongside a paper repo, point `[tool.uv.sources]` at a local checkout instead:
@@ -32,7 +32,7 @@ The backend is chosen from environment variables when `nnkit` is first imported:
 - **`nnkit.layers`**: `Linear`, `Embedding` (optional √d scaling), `Dropout`, `L2Norm` (unit length), `RMSNorm` (optional gain), `RoPE`, `SwiGLUFeedForward`, `TiedProjection` (output logits from an `Embedding`'s table), `MoEFeedForward` (shared + top-k routed experts, sigmoid gating on the expert output or, as in Llama 4, its input, bias-based load balancing, sparse dispatch), `MultiHeadAttention` (with GQA/MQA, QK-Norm with or without a learned gain, iRoPE temperature scaling, differential attention, and gated attention), `EncoderLayer`, `DecoderLayer`.
 - **`nnkit.losses`**: `LabelSmoothingLoss`, `z_loss` (keeps the softmax normaliser near 1).
 - **`nnkit.optimisers`**: `AdamW` (with global-norm gradient clipping), `Muon` (orthogonalised momentum for weight matrices, with `newton_schulz` and `split_muon_params`), `CosineSchedule`, `NoamSchedule`, `WSDSchedule` (warmup, stable, short decay).
-- **`nnkit.training`**: `Prefetcher` (builds batches on a background thread from any `make_epoch(rng)` function), `save_checkpoint` / `load_checkpoint` (model, optimizer state and arbitrary metadata in one `.npz`), `read_checkpoint_metadata`.
+- **`nnkit.training`**: `Prefetcher` (builds batches on a background thread from any `make_epoch(rng)` function), `packed_batches` (language-model windows cut from a packed `doc EOS doc EOS ...` token stream, with `document_ids` for `document_causal_mask`), `save_checkpoint` / `load_checkpoint` (model, optimizer state and arbitrary metadata in one `.npz`), `read_checkpoint_metadata`.
 
 ## Gradient Check
 
@@ -48,6 +48,9 @@ uv run python -m tests.training_check
 
 # Attention mask patterns
 uv run python -m tests.mask_check
+
+# Packed-stream batching for language models
+uv run python -m tests.packing_check
 
 # Optimisers and learning-rate schedules
 uv run python -m tests.optim_check
