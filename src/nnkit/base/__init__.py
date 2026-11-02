@@ -17,6 +17,7 @@ from .backend import (
     xp,
 )
 from .buffer import Buffer
+from .kv_cache import KVCache
 from .masking import (
     causal_mask,
     chunked_causal_mask,
@@ -34,6 +35,7 @@ __all__ = [
     "INT",
     "Array",
     "Buffer",
+    "KVCache",
     "Module",
     "Param",
     "asarray",

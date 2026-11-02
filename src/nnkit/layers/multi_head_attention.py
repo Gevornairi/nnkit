@@ -6,6 +6,7 @@ import math
 from ..activations.sigmoid import sigmoid, sigmoid_backward
 from ..activations.softmax import softmax, softmax_backward
 from ..base.backend import Array, xp
+from ..base.kv_cache import KVCache
 from ..base.module import Module
 from ..base.param import Param
 from .dropout import Dropout
@@ -60,6 +61,11 @@ class MultiHeadAttention(Module):
     (gated attention, Qiu et al., 2025; Qwen3-Next): one gate per output
     dimension, or one per head. A head can then shrink its output to ~0
     instead of parking attention on a sink token.
+
+    With a ``KVCache`` (self-attention only), ``forward`` decodes incrementally:
+    see ``KVCache``. The mask then covers the cached keys too,
+    (..., T_q, cache.length + T_q). A cached forward is inference-only and
+    cannot be followed by ``backward``.
 
     Shapes: query_in (batch, T_q, d_model), kv_in (batch, T_k, d_model),
     mask broadcastable to (batch, n_heads, T_q, T_k) -> (batch, T_q, d_model).
@@ -178,9 +184,12 @@ class MultiHeadAttention(Module):
         b, _, *rest = dx.shape
         return dx.reshape(b, self.n_kv_heads, self.n_rep, *rest).sum(axis=2)
 
-    def _temp_scale(self, q: Array) -> Array:
-        """Position-dependent query scale (T_q, 1): 1 + alpha * log(1 + floor((t + 1) / floor_len))."""
-        t = xp.arange(q.shape[-2], dtype=q.dtype)[:, None]
+    def _temp_scale(self, q: Array, offset: int = 0) -> Array:
+        """Position-dependent query scale (T_q, 1): 1 + alpha * log(1 + floor((t + 1) / floor_len)).
+
+        Positions start at ``offset`` (nonzero when decoding with a KV cache).
+        """
+        t = xp.arange(offset, offset + q.shape[-2], dtype=q.dtype)[:, None]
         steps = xp.floor((t + 1.0) / self.attn_scale_floor)
         return 1.0 + self.attn_scale_alpha * xp.log(1.0 + steps)
 
@@ -197,8 +206,13 @@ class MultiHeadAttention(Module):
         return dz[..., 0].transpose(0, 2, 1)
 
     def forward(
-        self, query_in: Array, kv_in: Array, mask: Array | None = None
+        self,
+        query_in: Array,
+        kv_in: Array,
+        mask: Array | None = None,
+        kv_cache: KVCache | None = None,
     ) -> Array:
+        offset = 0 if kv_cache is None else kv_cache.length
         q = self._split_heads(self.w_q.forward(query_in), self.n_heads)
         k = self._split_heads(self.w_k.forward(kv_in), self.n_kv_heads)
         v = self._split_heads(self.w_v.forward(kv_in), self.n_kv_heads)
@@ -213,15 +227,18 @@ class MultiHeadAttention(Module):
             k = self.k_norm.forward(k)
 
         if self.rope is not None:
-            q = self.rope.forward(q)
-            k = self.rope.forward(k)
+            q = self.rope.forward(q, offset)
+            k = self.rope.forward(k, offset)
 
         if self.qk_norm and not self.qk_norm_before_rope:
             q = self.q_norm.forward(q)
             k = self.k_norm.forward(k)
 
         if self.attn_scale_alpha:
-            q = q * self._temp_scale(q)
+            q = q * self._temp_scale(q, offset)
+
+        if kv_cache is not None:
+            k, v = kv_cache.append(k, v)
 
         k, v = self._repeat_kv(k), self._repeat_kv(v)
 
@@ -250,7 +267,10 @@ class MultiHeadAttention(Module):
         out = self.w_o.forward(self._merge_heads(context))
         self.attn_weights = attn
         # q and k are cached after RoPE / QK-Norm / temp scaling: d_scores is w.r.t. the final q and k
-        self._cache = (q, k, v, probs, attn_dropped, mask)
+        # (a decoding forward saves nothing, so a backward after it fails loudly)
+        self._cache = (
+            None if kv_cache is not None else (q, k, v, probs, attn_dropped, mask)
+        )
 
         return out
 

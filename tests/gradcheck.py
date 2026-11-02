@@ -28,7 +28,13 @@ from nnkit.layers import (
     RoPE,
     TiedProjection,
 )
-from nnkit.losses import LabelSmoothingLoss, z_loss
+from nnkit.losses import (
+    GRPOLoss,
+    LabelSmoothingLoss,
+    group_advantages,
+    token_logp,
+    z_loss,
+)
 
 PAD, BOS, VOCAB_SIZE = 0, 1, 7
 SRC = [[3, 4, 5, 6], [5, 3, 0, 0]]
@@ -357,6 +363,38 @@ def check_z_loss() -> float:
     return relative_error([logits], reference_grads([logits], loss_of_model))
 
 
+def check_grpo_loss(beta: float) -> float:
+    """GRPO loss on three completions with prompt and padding positions masked.
+
+    Also checks that with one completion, advantage 1 and no KL it is plain
+    cross-entropy, and that advantages are normalised within each group.
+    """
+    seed(0)
+    logits = Param(normal(1.0, (3, 5, VOCAB_SIZE)))
+    # PAD at prompt positions (start) and padding (end): neither gets gradient
+    targets = asarray([[PAD, 3, 4, 5, 2], [PAD, PAD, 6, 2, PAD], [PAD, 5, 2, PAD, PAD]])
+    advantages = asarray([1.2, -0.5, 0.3])
+    ref_logp = token_logp(logits.value + normal(0.5, logits.shape), targets)
+    loss_fn = GRPOLoss(PAD, beta)
+
+    def loss_of_model():
+        return loss_fn(logits.value, targets, advantages, ref_logp)[0]
+
+    logits.grad = loss_fn(logits.value, targets, advantages, ref_logp)[1]
+    assert not np.any(to_numpy(logits.grad)[0, 0]), "prompt position got gradient"
+    assert not np.any(to_numpy(logits.grad)[1, 4]), "PAD position got gradient"
+
+    ce = LabelSmoothingLoss(VOCAB_SIZE, PAD, 0.0)
+    ce_grad = to_numpy(ce(logits.value[:1], targets[:1])[1])
+    pg_grad = to_numpy(GRPOLoss(PAD)(logits.value[:1], targets[:1], asarray([1.0]))[1])
+    assert np.abs(ce_grad - pg_grad).max() < 1e-6, "A=1, beta=0 is not cross-entropy"
+
+    adv = to_numpy(group_advantages(asarray([1.0, 0.0, 0.0, 1.0, 2.0, 2.0]), 2))
+    assert np.allclose(adv, [1, -1, -1, 1, 0, 0], atol=1e-3), adv
+
+    return relative_error([logits], reference_grads([logits], loss_of_model))
+
+
 def check_embedding(scale: bool) -> float:
     """Embedding lookup with and without the sqrt(d_model) scale; ids repeat on purpose,
     so gradients of a token used twice must accumulate."""
@@ -470,6 +508,9 @@ def main() -> int:
 
     report("softcap cap=5", check_softcap(5.0))
     report("z-loss", check_z_loss())
+
+    for beta in (0.0, 0.1):
+        report(f"grpo loss beta={beta}", check_grpo_loss(beta))
 
     for gate in ("elementwise", "headwise"):
         for h, g, kwargs in [

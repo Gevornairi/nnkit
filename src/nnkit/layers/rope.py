@@ -36,16 +36,20 @@ class RoPE(Module):
         x1, x2 = x[..., : self.half], x[..., self.half :]
         return xp.concatenate([-x2, x1], axis=-1)
 
-    def _tables(self, x: Array) -> tuple[Array, Array]:
-        """cos/sin rows for positions 0..T-1, where T = x.shape[-2]."""
-        t = x.shape[-2]
-        if t > self.max_len:
-            raise ValueError(f"sequence length {t} exceeds RoPE max_len={self.max_len}")
-        return self.cos[:t], self.sin[:t]
+    def _tables(self, x: Array, offset: int = 0) -> tuple[Array, Array]:
+        """cos/sin rows for positions offset..offset+T-1, where T = x.shape[-2]."""
+        end = offset + x.shape[-2]
+        if end > self.max_len:
+            raise ValueError(f"position {end - 1} exceeds RoPE max_len={self.max_len}")
+        return self.cos[offset:end], self.sin[offset:end]
 
-    def forward(self, x: Array) -> Array:
-        """x (batch, heads, T, d_k) -> the same shape, rotated by position along T."""
-        cos, sin = self._tables(x)
+    def forward(self, x: Array, offset: int = 0) -> Array:
+        """x (batch, heads, T, d_k) -> the same shape, rotated by position along T.
+
+        ``offset`` is the position of the first row: nonzero when decoding with a
+        KV cache, where x holds only the tokens after the cached ones.
+        """
+        cos, sin = self._tables(x, offset)
         return x * cos + self._rotate_half(x) * sin
 
     def backward(self, dy: Array) -> Array:
