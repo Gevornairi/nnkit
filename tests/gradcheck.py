@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from nnkit.activations import sigmoid, softcap, softcap_backward
+from nnkit.activations import GELU, sigmoid, softcap, softcap_backward
 from nnkit.base import (
     BACKEND,
     Module,
@@ -20,21 +20,31 @@ from nnkit.layers import (
     DecoderLayer,
     Embedding,
     EncoderLayer,
+    GELUFeedForward,
     L2Norm,
+    LayerNorm,
+    LayerScale,
     Linear,
     MoEFeedForward,
     MultiHeadAttention,
+    PatchEmbedding,
     RMSNorm,
     RoPE,
+    RoPE2D,
+    SwiGLUFeedForward,
     TiedProjection,
 )
 from nnkit.losses import (
     GRPOLoss,
     LabelSmoothingLoss,
+    gram_loss,
     group_advantages,
+    koleo_loss,
+    soft_cross_entropy,
     token_logp,
     z_loss,
 )
+from nnkit.training import sinkhorn_knopp
 
 PAD, BOS, VOCAB_SIZE = 0, 1, 7
 SRC = [[3, 4, 5, 6], [5, 3, 0, 0]]
@@ -43,7 +53,8 @@ TGT_OUT = [[6, 5, 4, 3, 2], [3, 5, 2, 0, 0]]
 
 
 def reference_grads(params: list[Param], loss_of_model) -> list[np.ndarray]:
-    """Gradients of ``loss_of_model()`` w.r.t. ``params``: MLX autodiff, or central differences on NumPy."""
+    """Gradients of ``loss_of_model()`` w.r.t. ``params``: MLX autodiff, or central differences
+    on NumPy and CuPy."""
     if BACKEND == "mlx":
 
         def loss_of_values(values):
@@ -57,7 +68,7 @@ def reference_grads(params: list[Param], loss_of_model) -> list[np.ndarray]:
     for p in params:
         num = np.zeros(p.shape)
         for ix in np.ndindex(*p.shape):
-            old = p.value[ix]
+            old = p.value[ix].item()  # a copy: on CuPy, p.value[ix] is a view
             p.value[ix] = old + 1e-6
             loss_plus = loss_of_model().item()
             p.value[ix] = old - 1e-6
@@ -153,21 +164,27 @@ def check_attention(
     return relative_error(params, reference_grads(params, loss_of_model))
 
 
-def check_norm(norm: L2Norm | RMSNorm) -> float:
-    """A normalisation layer on its own, input gradient included."""
+# one-input layers that check_layer accepts (Module itself declares no forward/backward)
+OneInputLayer = (
+    L2Norm | RMSNorm | LayerNorm | LayerScale | GELU | Linear | GELUFeedForward
+)
+
+
+def check_layer(layer: OneInputLayer, d_out: int = 8) -> float:
+    """A one-input layer on (2, 3, 8) on its own, input gradient included."""
     seed(0)
     x = Param(normal(1.0, (2, 3, 8)))
-    weights = normal(1.0, (2, 3, 8))
-    params = [x, *norm.parameters()]
-    for p in norm.parameters():
+    weights = normal(1.0, (2, 3, d_out))
+    params = [x, *layer.parameters()]
+    for p in layer.parameters():
         p.value = p.value + normal(0.3, p.shape)
 
     def loss_of_model():
-        return (norm.forward(x.value) * weights).sum()
+        return (layer.forward(x.value) * weights).sum()
 
-    norm.zero_grad()
-    norm.forward(x.value)
-    x.grad = norm.backward(weights)
+    layer.zero_grad()
+    layer.forward(x.value)
+    x.grad = layer.backward(weights)
 
     return relative_error(params, reference_grads(params, loss_of_model))
 
@@ -470,6 +487,141 @@ def check_tied_registration() -> None:
     assert model.head.parameters()[0] is model.embed.weight
 
 
+def check_patch_embedding() -> float:
+    """Patch embedding of a non-square image, image gradient included."""
+    seed(0)
+    patch = PatchEmbedding(patch_size=2, channels=3, d_model=8)
+    bias = patch.proj.bias
+    assert bias is not None
+    bias.value = normal(0.3, bias.shape)
+    image = Param(normal(1.0, (2, 4, 6, 3)))
+    weights = normal(1.0, (2, 6, 8))  # 2 x 3 patches
+    params = [image, *patch.parameters()]
+
+    def loss_of_model():
+        return (patch.forward(image.value) * weights).sum()
+
+    patch.zero_grad()
+    patch.forward(image.value)
+    image.grad = patch.backward(weights)
+
+    return relative_error(params, reference_grads(params, loss_of_model))
+
+
+def check_vit_block(norm: str, ffn: str, **attn_kwargs) -> float:
+    """A pre-norm ViT block as ommata builds it, from image to output, every gradient checked.
+
+        tokens = [prefix (CLS + registers); PatchEmbedding(image)]
+        h = tokens + LayerScale(attn(norm1(tokens)))    attention with RoPE2D
+        y = h + LayerScale(ffn(norm2(h)))
+
+    RoPE2D gets a non-trivial box (scale, shift), and LayerScale / norm gains
+    are jittered, so a gain of exactly 1 (or 1e-5) can't hide a bug.
+    """
+    seed(0)
+    d_model, n_heads, n_prefix, h, w = 16, 2, 2, 2, 3
+    norm_cls = {"layernorm": LayerNorm, "rmsnorm": RMSNorm}[norm]
+    patch = PatchEmbedding(patch_size=2, channels=3, d_model=d_model)
+    rope = RoPE2D(d_model // n_heads)
+    rope.set_grid(h, w, n_prefix, scale=(1.3, 0.7), shift=(0.1, -0.2))
+    attn = MultiHeadAttention(d_model, n_heads, 0.0, rope, **attn_kwargs)
+    norm1, norm2 = norm_cls(d_model), norm_cls(d_model)
+    if ffn == "gelu":
+        mlp = GELUFeedForward(d_model, 4 * d_model)
+    else:
+        mlp = SwiGLUFeedForward(d_model, 3 * d_model, 0.0)
+    ls1, ls2 = LayerScale(d_model), LayerScale(d_model)
+    modules = [patch, attn, norm1, norm2, mlp, ls1, ls2]
+    for m in modules:
+        for p in m.parameters():
+            if p.value.ndim == 1:
+                p.value = p.value + normal(0.3, p.shape)
+    image = Param(normal(1.0, (2, 2 * h, 2 * w, 3)))
+    prefix = Param(normal(1.0, (1, n_prefix, d_model)))
+    weights = normal(1.0, (2, n_prefix + h * w, d_model))
+    params = [image, prefix, *(p for m in modules for p in m.parameters())]
+
+    def forward():
+        patches = patch.forward(image.value)
+        prefixes = xp.broadcast_to(prefix.value, (2, n_prefix, d_model))
+        x = xp.concatenate([prefixes, patches], axis=1)
+        a = norm1.forward(x)
+        x = x + ls1.forward(attn.forward(a, a))
+        return x + ls2.forward(mlp.forward(norm2.forward(x)))
+
+    def loss_of_model():
+        return (forward() * weights).sum()
+
+    for m in modules:
+        m.zero_grad()
+    forward()
+    d_x = weights + norm2.backward(mlp.backward(ls2.backward(weights)))
+    d_q, d_kv = attn.backward(ls1.backward(d_x))
+    d_x = d_x + norm1.backward(d_q + d_kv)
+    prefix.grad = d_x[:, :n_prefix].sum(axis=0, keepdims=True)
+    image.grad = patch.backward(d_x[:, n_prefix:])
+
+    return relative_error(params, reference_grads(params, loss_of_model))
+
+
+def check_soft_cross_entropy(weighted: bool) -> float:
+    """DINO/iBOT loss against Sinkhorn-Knopp targets, with per-row weights for iBOT.
+
+    Also checks that it equals hard-label cross-entropy for one-hot targets.
+    """
+    seed(0)
+    logits = Param(normal(2.0, (2, 3, VOCAB_SIZE)))
+    targets = sinkhorn_knopp(normal(2.0, (6, VOCAB_SIZE)), 0.5).reshape(2, 3, -1)
+    weights = asarray([[0.5, 0.25, 0.25], [0.2, 0.3, 0.1]]) if weighted else None
+
+    def loss_of_model():
+        return soft_cross_entropy(logits.value, targets, 0.1, weights)[0]
+
+    logits.grad = soft_cross_entropy(logits.value, targets, 0.1, weights)[1]
+
+    labels = asarray([[3, 4, 5], [2, 6, 1]])
+    one_hot = (xp.arange(VOCAB_SIZE) == labels[..., None]).astype(logits.value.dtype)
+    ce = LabelSmoothingLoss(VOCAB_SIZE, PAD, 0.0)
+    soft = soft_cross_entropy(logits.value, one_hot)
+    hard = ce(logits.value, labels)
+    assert abs(float(soft[0]) - float(hard[0])) < 1e-5, "one-hot != cross-entropy"
+    assert np.abs(to_numpy(soft[1]) - to_numpy(hard[1])).max() < 1e-6
+
+    return relative_error([logits], reference_grads([logits], loss_of_model))
+
+
+def check_koleo() -> float:
+    """KoLeo over two groups of 5 features (the nearest neighbour is searched per group)."""
+    seed(0)
+    x = Param(normal(1.0, (2, 5, 4)))
+
+    def loss_of_model():
+        return koleo_loss(x.value)[0]
+
+    x.grad = koleo_loss(x.value)[1]
+
+    return relative_error([x], reference_grads([x], loss_of_model))
+
+
+def check_gram(remove_neg: bool) -> float:
+    """Gram anchoring on 2 images x 5 patches; the reference gets no gradient.
+
+    Also checks it is 0 for a reference whose features are the student's rescaled
+    (cosine similarities don't change), so only similarities are anchored.
+    """
+    seed(0)
+    x = Param(normal(1.0, (2, 5, 4)))
+    reference = normal(1.0, (2, 5, 4))
+
+    def loss_of_model():
+        return gram_loss(x.value, reference, remove_neg)[0]
+
+    x.grad = gram_loss(x.value, reference, remove_neg)[1]
+    assert float(gram_loss(x.value, 3.0 * x.value, remove_neg)[0]) < 1e-10
+
+    return relative_error([x], reference_grads([x], loss_of_model))
+
+
 def main() -> int:
     tol = 1e-4 if BACKEND == "mlx" else 1e-7
     ok = True
@@ -485,6 +637,7 @@ def main() -> int:
 
     nope_scale = {"attn_scale_alpha": 0.5, "attn_scale_floor": 2}
     for h, g, kwargs in [
+        (4, 2, {"bias": True}),
         (4, 2, {"qk_norm": True}),
         (4, 2, {"qk_norm": True, "qk_norm_gain": True}),
         (4, 2, {"diff_attn": True}),
@@ -504,7 +657,38 @@ def main() -> int:
         ("RMSNorm", RMSNorm(8)),
         ("RMSNorm gain=False", RMSNorm(8, gain=False)),
     ]:
-        report(f"norm {label}", check_norm(norm))
+        report(f"norm {label}", check_layer(norm))
+
+    for label, layer, d_out in [
+        ("LayerNorm", LayerNorm(8), 8),
+        ("LayerScale", LayerScale(8), 8),
+        ("GELU", GELU(), 8),
+        ("Linear bias=True", Linear(8, 5, bias=True), 5),
+        ("GELUFeedForward", GELUFeedForward(8, 32), 8),
+    ]:
+        report(f"layer {label}", check_layer(layer, d_out))
+    report("patch embedding", check_patch_embedding())
+    # a whole block sums many float32 terms into d_image; ~1e-4 on some seeds, a bug gives O(1)
+    block_tol = 1e-3 if BACKEND == "mlx" else tol
+    for norm, ffn, kwargs in [
+        ("layernorm", "gelu", {"bias": True}),
+        ("rmsnorm", "swiglu", {"qk_norm": True, "qk_norm_gain": True}),
+        ("rmsnorm", "swiglu", {"qk_norm": True, "gate": "elementwise"}),
+    ]:
+        opts = " ".join(f"{k}={v}" for k, v in kwargs.items())
+        report(
+            f"vit block {norm} {ffn} {opts}".rstrip(),
+            check_vit_block(norm, ffn, **kwargs),
+            block_tol,
+        )
+    for weighted in (False, True):
+        report(
+            f"soft cross-entropy weighted={weighted}",
+            check_soft_cross_entropy(weighted),
+        )
+    report("koleo", check_koleo())
+    for remove_neg in (False, True):
+        report(f"gram remove_neg={remove_neg}", check_gram(remove_neg))
 
     report("softcap cap=5", check_softcap(5.0))
     report("z-loss", check_z_loss())

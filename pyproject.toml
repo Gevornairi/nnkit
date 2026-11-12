@@ -1,16 +1,20 @@
 [project]
 name = "nnkit"
 version = "0.2.0"
-description = "From-scratch neural network toolkit with hand-written backward passes (MLX/NumPy)"
+description = "From-scratch neural network toolkit with hand-written backward passes (MLX/CuPy/NumPy)"
 readme = "README.md"
 authors = [
     { name = "Gevorg Khondkaryan", email = "gevorg.khondkaryan@gmail.com" }
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "mlx>=0.32.4",
+    "mlx>=0.32.4; sys_platform == 'darwin'",
     "numpy>=2.5.3",
 ]
+
+[project.optional-dependencies]
+# NVIDIA GPUs: the CuPy wheel must match the CUDA major version (cupy-cuda13x for CUDA 13)
+cuda = ["cupy-cuda12x>=13.3; sys_platform == 'linux' or sys_platform == 'win32'"]
 
 [build-system]
 requires = ["uv_build>=0.12.21,<0.13.0"]

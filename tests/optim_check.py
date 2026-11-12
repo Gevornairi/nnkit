@@ -6,6 +6,7 @@ Exits non-zero if any check fails.
 """
 
 import itertools
+from typing import Any
 
 import numpy as np
 
@@ -111,7 +112,8 @@ def check_split_muon_params() -> None:
     assert muon == [model.hidden.weight], muon
     assert {id(p) for p in adamw} == {id(model.embed.weight), id(model.norm.gain)}
     # the two optimisers together cover every parameter exactly once
-    Muon(muon, lambda s: 1e-3), AdamW(adamw, lambda s: 1e-3)
+    Muon(muon, lambda s: 1e-3)
+    AdamW(adamw, lambda s: 1e-3)
     assert len(muon) + len(adamw) == len(model.parameters())
 
 
@@ -135,7 +137,7 @@ def check_wsd_schedule() -> None:
     # decaying over the whole post-warmup range is allowed
     WSDSchedule(1.0, warmup=10, total_steps=100, decay_steps=90)
     for bad in ({"decay_steps": 0}, {"decay_steps": 95}, {"shape": "cos"}):
-        args = {
+        args: dict[str, Any] = {
             "max_lr": 1.0,
             "warmup": 10,
             "total_steps": 100,

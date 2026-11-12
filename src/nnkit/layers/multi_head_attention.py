@@ -13,6 +13,7 @@ from .dropout import Dropout
 from .linear import Linear
 from .rms_norm import RMSNorm
 from .rope import RoPE
+from .rope_2d import RoPE2D
 
 NEG_INF = -1e9  # score given to masked positions; exp() of it underflows to 0
 
@@ -33,8 +34,14 @@ class MultiHeadAttention(Module):
     ``n_rep = n_heads // n_kv_heads`` query heads (``n_kv_heads = 1`` is
     multi-query attention; Ainslie et al., 2023).
 
-    If ``rope`` is given, queries and keys are rotated by position after the
-    head split; pass it for self-attention only.
+    If ``rope`` is given (``RoPE``, or ``RoPE2D`` for image patches), queries
+    and keys are rotated by position after the head split; pass it for
+    self-attention only.
+
+    With ``bias=True`` the query, value and output projections get biases, as
+    in ViTs and DINOv3. The key projection never does, as DINOv3 masks it:
+    without QK-norm, a key bias only adds the same ``q . b_k`` to every score
+    in a query's row, which softmax cancels.
 
     If ``qk_norm`` is True, queries and keys are RMS-normalised per head:
     without a gain and after RoPE by default (Llama 4), or with a learned gain
@@ -76,7 +83,7 @@ class MultiHeadAttention(Module):
         d_model: int,
         n_heads: int,
         dropout: float = 0.1,
-        rope: RoPE | None = None,
+        rope: RoPE | RoPE2D | None = None,
         n_kv_heads: int | None = None,
         qk_norm: bool = False,
         qk_norm_gain: bool = False,
@@ -85,6 +92,7 @@ class MultiHeadAttention(Module):
         diff_attn: bool = False,
         lambda_init: float = 0.8,
         gate: str = "none",
+        bias: bool = False,
     ) -> None:
         super().__init__()
         if d_model % n_heads:
@@ -122,10 +130,10 @@ class MultiHeadAttention(Module):
                 f"rope is built for d_k={2 * rope.half}, needs {self.d_qk}"
             )
         self.scale = 1.0 / math.sqrt(self.d_qk)
-        self.w_q = Linear(d_model, d_model)
+        self.w_q = Linear(d_model, d_model, bias)
         self.w_k = Linear(d_model, n_kv_heads * self.d_k)
-        self.w_v = Linear(d_model, n_kv_heads * self.d_k)
-        self.w_o = Linear(d_model, d_model)
+        self.w_v = Linear(d_model, n_kv_heads * self.d_k, bias)
+        self.w_o = Linear(d_model, d_model, bias)
         self.attn_dropout = Dropout(dropout)
         self.register_modules(self.w_q, self.w_k, self.w_v, self.w_o, self.attn_dropout)
         self.rope = rope
