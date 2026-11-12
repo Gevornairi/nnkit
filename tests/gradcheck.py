@@ -40,8 +40,11 @@ from nnkit.losses import (
     gram_loss,
     group_advantages,
     koleo_loss,
+    random_directions,
+    sigreg_loss,
     soft_cross_entropy,
     token_logp,
+    view_invariance_loss,
     z_loss,
 )
 from nnkit.training import sinkhorn_knopp
@@ -622,6 +625,33 @@ def check_gram(remove_neg: bool) -> float:
     return relative_error([x], reference_grads([x], loss_of_model))
 
 
+def check_sigreg() -> float:
+    """SIGReg on 2 views x 6 samples x 4 features, with 5 fixed random slices."""
+    seed(0)
+    z = Param(normal(1.0, (2, 6, 4)))
+    a = random_directions(4, 5)
+
+    def loss_of_model():
+        return sigreg_loss(z.value, directions=a)[0]
+
+    z.grad = sigreg_loss(z.value, directions=a)[1]
+
+    return relative_error([z], reference_grads([z], loss_of_model))
+
+
+def check_view_invariance(n_global: int | None) -> float:
+    """LeJEPA's prediction term on 4 views; with 2 global views the center's gradient counts."""
+    seed(0)
+    z = Param(normal(1.0, (4, 3, 5)))
+
+    def loss_of_model():
+        return view_invariance_loss(z.value, n_global)[0]
+
+    z.grad = view_invariance_loss(z.value, n_global)[1]
+
+    return relative_error([z], reference_grads([z], loss_of_model))
+
+
 def main() -> int:
     tol = 1e-4 if BACKEND == "mlx" else 1e-7
     ok = True
@@ -689,6 +719,10 @@ def main() -> int:
     report("koleo", check_koleo())
     for remove_neg in (False, True):
         report(f"gram remove_neg={remove_neg}", check_gram(remove_neg))
+
+    report("sigreg", check_sigreg())
+    for n_global in (None, 2):
+        report(f"view invariance n_global={n_global}", check_view_invariance(n_global))
 
     report("softcap cap=5", check_softcap(5.0))
     report("z-loss", check_z_loss())

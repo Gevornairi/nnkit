@@ -1,4 +1,4 @@
-"""Properties of the vision / self-distillation pieces that gradient checks can't see.
+"""Properties of the vision / self-supervised pieces that gradient checks can't see.
 
 NNKIT_BACKEND=numpy NNKIT_DTYPE=float64 python -m tests.vision_check   # exact
 python -m tests.vision_check                                           # MLX
@@ -9,13 +9,22 @@ Exits non-zero if any check fails.
 import numpy as np
 
 from nnkit.activations import GELU
-from nnkit.base import BACKEND, asarray, normal, seed, to_numpy
+from nnkit.base import BACKEND, DTYPE, asarray, normal, seed, to_numpy, xp
 from nnkit.layers import DropPath, Linear, PatchEmbedding, RoPE2D
-from nnkit.losses import koleo_loss
+from nnkit.losses import (
+    koleo_loss,
+    random_directions,
+    sigreg_loss,
+    view_invariance_loss,
+)
 from nnkit.training import ema_update, sinkhorn_knopp
 
-# MLX GPU matmuls are ~1e-3 relative; a wrong rotation or ordering gives O(1)
-TOLERANCE = 1e-2 if BACKEND == "mlx" else 1e-10
+# MLX GPU matmuls are ~1e-3 relative and float32 sums ~1e-7; a wrong rotation,
+# ordering or formula gives O(1)
+if BACKEND == "mlx":
+    TOLERANCE = 1e-2
+else:
+    TOLERANCE = 1e-10 if DTYPE == xp.float64 else 1e-5
 
 
 def check_rope_2d() -> None:
@@ -145,6 +154,41 @@ def check_gelu_and_koleo() -> None:
     assert abs(both - each) < 1e-5, "groups are not independent"
 
 
+def check_sigreg() -> None:
+    """Matches the Epps-Pulley integral computed directly; low for N(0, I), high for collapse."""
+    seed(0)
+    z = normal(1.0, (2, 64, 8))
+    a = random_directions(8, 16)
+    assert np.abs(np.linalg.norm(to_numpy(a), axis=0) - 1).max() < 1e-5
+
+    # the statistic straight from its definition: complex characteristic function,
+    # trapezoid over the whole symmetric interval [-3, 3]
+    t = np.linspace(-3.0, 3.0, 33)
+    x = (to_numpy(z) @ to_numpy(a))[..., None] * t  # (views, N, slices, knots)
+    phi = np.exp(1j * x).mean(axis=1)
+    integrand = np.abs(phi - np.exp(-(t**2) / 2)) ** 2 * np.exp(-(t**2) / 2)
+    expected = (64 * np.trapezoid(integrand, t, axis=-1)).mean()
+    loss = float(sigreg_loss(z, directions=a)[0])
+    assert abs(loss - expected) / expected < TOLERANCE, (loss, expected)
+
+    collapsed = float(sigreg_loss(z[:, :1] + 0 * z, directions=a)[0])
+    stretched = float(sigreg_loss(3.0 * z, directions=a)[0])
+    assert loss < 0.1 * min(collapsed, stretched), (loss, collapsed, stretched)
+
+
+def check_view_invariance() -> None:
+    """Zero when every view agrees; the center is the mean of the global views only."""
+    seed(0)
+    one = normal(1.0, (1, 3, 5))
+    same = one + 0 * normal(1.0, (4, 3, 5))
+    assert float(view_invariance_loss(same)[0]) < 1e-12
+
+    z = to_numpy(normal(1.0, (4, 3, 5)))
+    expected = ((z - z[:2].mean(axis=0)) ** 2).mean()
+    loss = float(view_invariance_loss(asarray(z), n_global=2)[0])
+    assert abs(loss - expected) / expected < TOLERANCE, (loss, expected)
+
+
 def main():
     ok = True
     for check in (
@@ -155,6 +199,8 @@ def main():
         check_ema,
         check_drop_path,
         check_gelu_and_koleo,
+        check_sigreg,
+        check_view_invariance,
     ):
         try:
             check()
