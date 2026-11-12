@@ -159,6 +159,10 @@ class MultiHeadAttention(Module):
             self.register_modules(self.w_g)
         # attention probabilities of the last forward, (batch, n_heads, T_q, T_k), for plotting
         self.attn_weights: Array | None = None
+        # largest unmasked score per head in the last forward, (n_heads,), for monitoring
+        # the logit growth that QK-Norm (or QK-clip) guards against
+        self.max_score: Array | None = None
+
         self._cache = None
 
     def _split_heads(self, x: Array, n_heads: int) -> Array:
@@ -253,6 +257,7 @@ class MultiHeadAttention(Module):
         scores = (q @ xp.swapaxes(k, -1, -2)) * self.scale
         if mask is not None:
             scores = xp.where(mask, scores, NEG_INF)
+        self.max_score = scores.max(axis=tuple(i for i in range(scores.ndim) if i != 1))
         probs = softmax(scores, axis=-1)  # (batch, n_heads, [2,] T_q, T_k)
 
         if self.diff_attn:

@@ -10,7 +10,7 @@ import numpy as np
 
 from nnkit.activations import GELU
 from nnkit.base import BACKEND, DTYPE, asarray, normal, seed, to_numpy, xp
-from nnkit.layers import DropPath, Linear, PatchEmbedding, RoPE2D
+from nnkit.layers import DropPath, Linear, MultiHeadAttention, PatchEmbedding, RoPE2D
 from nnkit.losses import (
     koleo_loss,
     random_directions,
@@ -189,6 +189,32 @@ def check_view_invariance() -> None:
     assert abs(loss - expected) / expected < TOLERANCE, (loss, expected)
 
 
+def check_attention_max_score() -> None:
+    """``max_score`` is each head's largest q.k / sqrt(d_k); QK-Norm caps it at sqrt(d_k)."""
+    seed(0)
+    d_model, n_heads = 16, 2
+    d_k = d_model // n_heads
+    x = 5.0 * normal(1.0, (2, 6, d_model))  # large inputs, so unnormalised scores grow
+    attn = MultiHeadAttention(d_model, n_heads, 0.0)
+    attn.forward(x, x)
+    xs = to_numpy(x)
+    q = (xs @ to_numpy(attn.w_q.weight.value)).reshape(2, 6, n_heads, d_k)
+    k = (xs @ to_numpy(attn.w_k.weight.value)).reshape(2, 6, n_heads, d_k)
+    scores = np.einsum("bqhd,bkhd->bhqk", q, k) / np.sqrt(d_k)
+    expected = scores.max(axis=(0, 2, 3))
+    got = to_numpy(attn.max_score)
+    assert got.shape == (n_heads,), got.shape
+    assert np.abs(got - expected).max() / np.abs(expected).max() < TOLERANCE, (
+        got,
+        expected,
+    )
+    assert expected.max() > np.sqrt(d_k), "test inputs too small to show the cap"
+
+    normed = MultiHeadAttention(d_model, n_heads, 0.0, qk_norm=True)
+    normed.forward(x, x)
+    assert to_numpy(normed.max_score).max() <= np.sqrt(d_k) * (1 + 1e-4)
+
+
 def main():
     ok = True
     for check in (
@@ -201,6 +227,7 @@ def main():
         check_gelu_and_koleo,
         check_sigreg,
         check_view_invariance,
+        check_attention_max_score,
     ):
         try:
             check()

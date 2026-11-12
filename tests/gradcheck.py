@@ -525,7 +525,7 @@ def check_vit_block(norm: str, ffn: str, **attn_kwargs) -> float:
     d_model, n_heads, n_prefix, h, w = 16, 2, 2, 2, 3
     norm_cls = {"layernorm": LayerNorm, "rmsnorm": RMSNorm}[norm]
     patch = PatchEmbedding(patch_size=2, channels=3, d_model=d_model)
-    rope = RoPE2D(d_model // n_heads)
+    rope = RoPE2D(d_model // n_heads // (2 if attn_kwargs.get("diff_attn") else 1))
     rope.set_grid(h, w, n_prefix, scale=(1.3, 0.7), shift=(0.1, -0.2))
     attn = MultiHeadAttention(d_model, n_heads, 0.0, rope, **attn_kwargs)
     norm1, norm2 = norm_cls(d_model), norm_cls(d_model)
@@ -704,6 +704,7 @@ def main() -> int:
         ("layernorm", "gelu", {"bias": True}),
         ("rmsnorm", "swiglu", {"qk_norm": True, "qk_norm_gain": True}),
         ("rmsnorm", "swiglu", {"qk_norm": True, "gate": "elementwise"}),
+        ("rmsnorm", "swiglu", {"qk_norm": True, "diff_attn": True}),
     ]:
         opts = " ".join(f"{k}={v}" for k, v in kwargs.items())
         report(
